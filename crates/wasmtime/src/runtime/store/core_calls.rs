@@ -560,9 +560,13 @@ impl<T: Send + 'static> Future for CoreCallFuture<'_, T> {
             }
             FiberPoll::Finished(result) => {
                 let entry = this.store.inner.core_calls.entry_mut(this.id).unwrap();
-                if let Err(error) = result {
-                    entry.outcome = Some(Outcome::Public(CoreCallOutcome::Trapped(error)));
-                }
+                // The root closure records every guest result and returns Ok.
+                // An error here violates that contract; never overwrite an
+                // already-owned exception without its collector barrier.
+                assert!(
+                    result.is_ok(),
+                    "core root fiber returned an unrecorded error"
+                );
                 assert!(entry.outcome.is_some());
                 entry.phase = Phase::Finished;
                 this.fiber.take();
@@ -738,39 +742,41 @@ impl StoreOpaque {
         });
         // Callback, Caller, and its LIFO root scope have already returned. Only
         // runtime Send-compatible frames and guest frames span this suspension.
+        debug_assert_eq!(
+            (entry.depth, entry.exclusive, entry.suspend),
+            (1, 0, suspend)
+        );
         self.with_blocking(|_, cx| cx.suspend(StoreFiberYield::ReleaseStore))?;
         let entry = self.core_calls.entry_mut(id).unwrap();
         assert_eq!(entry.phase, Phase::Running);
         Ok(entry.reply.take().unwrap())
     }
     fn finish_core_execution(&mut self, id: CoreCallId, result: Result<Vec<CoreValue>>) {
+        // A pending payload is exception authority only when paired with the
+        // ThrownException marker. Host code may discard that marker and return
+        // normally or report an unrelated error; retain its actual result.
         #[cfg(feature = "gc")]
-        let exception = self.take_core_pending_exception();
-        let outcome = match result {
-            Ok(values) => Outcome::Public(CoreCallOutcome::Returned(values)),
-            Err(error) => Outcome::Public(CoreCallOutcome::Trapped(error)),
-        };
-        #[cfg(feature = "gc")]
-        let outcome = if let Some(exception) = exception {
-            let error = match outcome {
-                Outcome::Public(CoreCallOutcome::Trapped(error)) => error,
-                _ => crate::ThrownException.into(),
-            };
-            Outcome::Exception { exception, error }
-        } else {
-            outcome
-        };
-        let outcome = match outcome {
-            Outcome::Public(CoreCallOutcome::Trapped(error))
-                if error.is::<crate::ThrownException>() =>
+        if let Some(exception) = self.take_core_pending_exception() {
+            if result
+                .as_ref()
+                .is_err_and(|error| error.is::<crate::ThrownException>())
             {
-                Outcome::Public(CoreCallOutcome::Trapped(
-                    CoreCallError::UnrootedException.into(),
-                ))
+                self.core_calls.entry_mut(id).unwrap().outcome = Some(Outcome::Exception {
+                    exception,
+                    error: result.unwrap_err(),
+                });
+                return;
             }
-            outcome => outcome,
+            self.unwrap_gc_store_mut().drop_gc_ref(exception);
+        }
+        let outcome = match result {
+            Ok(values) => CoreCallOutcome::Returned(values),
+            Err(error) if error.is::<crate::ThrownException>() => {
+                CoreCallOutcome::Trapped(CoreCallError::UnrootedException.into())
+            }
+            Err(error) => CoreCallOutcome::Trapped(error),
         };
-        self.core_calls.entry_mut(id).unwrap().outcome = Some(outcome);
+        self.core_calls.entry_mut(id).unwrap().outcome = Some(Outcome::Public(outcome));
     }
     fn finish_core_cancellation(&mut self, id: CoreCallId) {
         let entry = self.core_calls.entry_mut(id).unwrap();
@@ -867,14 +873,20 @@ impl StoreOpaque {
             return Ok(None);
         };
         let exception = exception.unchecked_copy();
-        #[cfg(test)]
-        if core::mem::take(&mut self.core_calls.fail_outcome_root) {
-            return Err(crate::OutOfMemory::new(1).into());
-        }
         let owned = self.unwrap_gc_store_mut().clone_gc_ref(&exception);
         let backup = owned.unchecked_copy();
         let mut nogc = super::AutoAssertNoGc::new(self);
-        match crate::OwnedRooted::new(&mut nogc, owned) {
+        // Inject the conversion failure after cloning so tests exercise the
+        // same rollback barrier as a failed owned-root allocation.
+        #[cfg(test)]
+        let rooted = if core::mem::take(&mut nogc.core_calls.fail_outcome_root) {
+            Err(crate::OutOfMemory::new(1))
+        } else {
+            crate::OwnedRooted::new(&mut nogc, owned)
+        };
+        #[cfg(not(test))]
+        let rooted = crate::OwnedRooted::new(&mut nogc, owned);
+        match rooted {
             Ok(root) => Ok(Some(root)),
             Err(error) => {
                 nogc.unwrap_gc_store_mut().drop_gc_ref(backup);
@@ -884,12 +896,22 @@ impl StoreOpaque {
     }
 }
 
-#[cfg(all(test, feature = "gc-copying", feature = "cranelift", feature = "wat"))]
+#[cfg(all(
+    test,
+    any(feature = "gc-copying", feature = "gc-drc"),
+    feature = "cranelift",
+    feature = "wat"
+))]
 mod tests {
     use super::*;
-    use crate::{Collector, Config, Engine, Instance, Module};
+    #[cfg(feature = "gc-copying")]
+    use crate::Instance;
+    #[cfg(feature = "gc")]
+    use crate::{Collector, Config};
+    use crate::{Engine, Module};
     use core::task::Waker;
 
+    #[cfg(feature = "gc-copying")]
     #[test]
     fn core_calls_outcome_root_failure_preserves_generation_and_payload() -> Result<()> {
         let mut config = Config::new();
@@ -929,6 +951,73 @@ mod tests {
         let tag = instance.get_tag(&mut store, "tag").unwrap();
         assert!(crate::Tag::eq(&exception.tag(&mut store)?, &tag, &store));
         assert!(store.inner.core_calls.entry(id).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "gc-drc")]
+    #[test]
+    fn core_calls_failed_outcome_root_drops_cloned_reference() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Payload(Arc<AtomicUsize>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut config = Config::new();
+        config
+            .collector(Collector::DeferredReferenceCounting)
+            .wasm_exceptions(true);
+        let engine = Engine::new(&config)?;
+        let mut store = Store::new(&engine, ());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut linker = crate::Linker::new(&engine);
+        let counter = drops.clone();
+        linker.func_wrap("test", "make", move |mut caller: crate::Caller<'_, ()>| {
+            crate::ExternRef::new(&mut caller, Payload(counter.clone())).map(Some)
+        })?;
+        let module = Module::new(
+            &engine,
+            r#"(module
+            (import "test" "make" (func $make (result externref)))
+            (tag $tag (param externref))
+            (func (export "run") call $make throw $tag))"#,
+        )?;
+        let instance = linker.instantiate(&mut store, &module)?;
+        let func = instance.get_func(&mut store, "run").unwrap();
+        let id = store.start_core_call(func, vec![])?;
+        let mut future = Box::pin(store.resume_core_call(id)?);
+        assert!(matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(CoreCallEvent::Finished { .. }))
+        ));
+        drop(future);
+        store.inner.core_calls.fail_outcome_root = true;
+        let Err(error) = store.take_core_call_outcome(id) else {
+            panic!("failure hook did not fire")
+        };
+        assert!(error.is::<crate::OutOfMemory>());
+        store.gc(None)?;
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "original outcome lost after failed conversion"
+        );
+        let CoreCallOutcome::Exception { exception, .. } = store.take_core_call_outcome(id)? else {
+            panic!("outcome lost after failed conversion")
+        };
+        drop(exception);
+        store.gc(None)?;
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "failed outcome conversion leaked cloned root"
+        );
         Ok(())
     }
 }

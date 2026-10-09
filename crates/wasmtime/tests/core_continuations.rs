@@ -830,11 +830,13 @@ mod gc_controls {
             store.gc(None)?;
             // This check must precede resumption: a tracing mutation cannot be
             // allowed to dereference an intentionally collected guest root.
-            assert_eq!(
-                drops.load(Ordering::SeqCst),
-                baseline,
-                "collected suspended operand/local"
-            );
+            let observed = drops.load(Ordering::SeqCst);
+            if observed != baseline {
+                // A missing-tracing mutation invalidates the saved guest stack.
+                // Leak it before failing, so teardown cannot touch those roots.
+                std::mem::forget(store);
+                panic!("collected suspended operand/local: {observed} != {baseline}");
+            }
             let order = if n % 2 == 0 {
                 [(a, aw), (c, cw)]
             } else {
@@ -896,11 +898,12 @@ mod gc_controls {
             ids.push(id);
         }
         store.gc(None)?;
-        assert_eq!(
-            drops.load(Ordering::SeqCst),
-            0,
-            "collected pending outcome payload"
-        );
+        let observed = drops.load(Ordering::SeqCst);
+        if observed != 0 {
+            // Do not extract or dispose an intentionally untraced VMGcRef.
+            std::mem::forget(store);
+            panic!("collected pending outcome payload: {observed} != 0");
+        }
         let func = instance.get_func(&mut store, "ok").unwrap();
         let ok = store.start_core_call(func, vec![])?;
         store.resume_core_call(ok)?.await?;
@@ -1663,6 +1666,69 @@ async fn core_continuations_hook_reentry() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "call-hook")]
+#[tokio::test]
+async fn core_continuations_suspending_hook_reentry() -> Result<()> {
+    struct Hook {
+        target: CallHook,
+        func: TypedFunc<(), ()>,
+        hits: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl CallHookHandler<()> for Hook {
+        async fn handle_call_event(
+            &self,
+            mut store: StoreContextMut<'_, ()>,
+            event: CallHook,
+        ) -> Result<()> {
+            if std::mem::discriminant(&event) == std::mem::discriminant(&self.target) {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                error(
+                    self.func.call_async(&mut store, ()).await,
+                    CoreCallError::ExclusiveHostFrame,
+                );
+            }
+            Ok(())
+        }
+    }
+    let engine = Engine::default();
+    for event in [
+        CallHook::CallingWasm,
+        CallHook::ReturningFromWasm,
+        CallHook::CallingHost,
+        CallHook::ReturningFromHost,
+    ] {
+        let mut store = Store::new(&engine, ());
+        let mut linker = Linker::new(&engine);
+        poll_import(&mut linker, &engine)?;
+        linker.func_new_suspending("test", "host", FuncType::new(&engine, [], []), |_, _| {
+            Ok(CoreHostStep::Suspend(7))
+        })?;
+        let module = Module::new(
+            &engine,
+            r#"(module (import "test" "poll" (func $poll (param i32)))
+          (import "test" "host" (func $host)) (func (export "child") i32.const 0 call $poll)
+          (func (export "run") call $host))"#,
+        )?;
+        let instance = linker.instantiate_async(&mut store, &module).await?;
+        let func = instance.get_typed_func::<(), ()>(&mut store, "child")?;
+        let hits = Arc::new(AtomicUsize::new(0));
+        store.call_hook_async(Hook {
+            target: event,
+            func,
+            hits: hits.clone(),
+        });
+        let func = instance.get_func(&mut store, "run").unwrap();
+        let id = store.start_core_call(func, vec![])?;
+        let w = wait(store.resume_core_call(id)?.await?, id);
+        store.complete_core_host_wait(w, CoreHostResult::Return(vec![]))?;
+        store.resume_core_call(id)?.await?;
+        finish_ok(&mut store, id)?;
+        assert!(hits.load(Ordering::SeqCst) > 0);
+    }
+    Ok(())
+}
+
 #[cfg(feature = "pooling-allocator")]
 #[tokio::test]
 async fn core_continuations_stack_pool_exhaustion() -> Result<()> {
@@ -1985,7 +2051,7 @@ mod outcome_classification {
             match store.take_core_call_outcome(id)? {
                 CoreCallOutcome::Trapped(error) if return_error => {
                     assert!(
-                        error.to_string().contains("ordinary host failure"),
+                        format!("{error:#}").contains("ordinary host failure"),
                         "lost original host diagnostic: {error:?}"
                     );
                     assert!(!error.is::<ThrownException>());
@@ -2014,3 +2080,120 @@ mod outcome_classification {
     }
 }
 
+#[tokio::test]
+async fn core_continuations_suspending_host_root() -> Result<()> {
+    fn assert_send<T: Send>(_: &T) {}
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let mut linker = Linker::new(&engine);
+    linker.func_new_suspending(
+        "test",
+        "root",
+        FuncType::new(&engine, [ValType::I32], [ValType::I64]),
+        |_, args| {
+            assert_eq!(args, [CoreValue::I32(42)]);
+            Ok(CoreHostStep::Suspend(42))
+        },
+    )?;
+    let func = linker
+        .get(&mut store, "test", "root")
+        .unwrap()
+        .into_func()
+        .unwrap();
+    let id = store.start_core_call(func, vec![CoreValue::I32(42)])?;
+    let future = store.resume_core_call(id)?;
+    assert_send(&future);
+    let w = wait(future.await?, id);
+    store.complete_core_host_wait(w, CoreHostResult::Return(vec![CoreValue::I64(123)]))?;
+    assert_eq!(
+        store.resume_core_call(id)?.await?,
+        CoreCallEvent::Finished { call: id }
+    );
+    let CoreCallOutcome::Returned(values) = store.take_core_call_outcome(id)? else {
+        panic!("direct suspending host root did not return")
+    };
+    assert_eq!(values, [CoreValue::I64(123)]);
+    Ok(())
+}
+
+#[cfg(feature = "call-hook")]
+#[tokio::test]
+async fn core_continuations_teardown_drains_before_user_data() -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+    const CHILD: &str = "WASMTIME_CORE_TEARDOWN_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "core_continuations_teardown_drains_before_user_data",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .spawn()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                assert!(status.success(), "teardown ordering child failed: {status}");
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill()?;
+                child.wait()?;
+                panic!("teardown ordering child exceeded 30 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    struct Data(Arc<AtomicBool>);
+    impl Drop for Data {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let engine = Engine::default();
+    for into_data in [false, true] {
+        let alive = Arc::new(AtomicBool::new(true));
+        let drained = Arc::new(AtomicUsize::new(0));
+        let mut store = Store::new(&engine, Data(alive.clone()));
+        let mut linker = Linker::new(&engine);
+        linker.func_new_suspending("test", "poll", FuncType::new(&engine, [], []), |_, _| {
+            Ok(CoreHostStep::Suspend(1))
+        })?;
+        let module = Module::new(
+            &engine,
+            r#"(module
+            (import "test" "poll" (func $poll)) (func (export "run") call $poll))"#,
+        )?;
+        let instance = linker.instantiate_async(&mut store, &module).await?;
+        let func = instance.get_func(&mut store, "run").unwrap();
+        for _ in 0..2 {
+            let id = store.start_core_call(func, vec![])?;
+            wait(store.resume_core_call(id)?.await?, id);
+        }
+        let live = alive.clone();
+        let count = drained.clone();
+        store.call_hook(move |store, event| {
+            if matches!(event, CallHook::ReturningFromHost) {
+                // Check external state BEFORE accessing T on the resumed fiber.
+                assert!(
+                    live.load(Ordering::SeqCst),
+                    "released fiber disposed after user data dropped"
+                );
+                assert!(store.data().0.load(Ordering::SeqCst));
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        if into_data {
+            let data = store.into_data();
+            assert!(alive.load(Ordering::SeqCst));
+            assert_eq!(drained.load(Ordering::SeqCst), 2);
+            drop(data);
+        } else {
+            drop(store);
+        }
+        assert!(!alive.load(Ordering::SeqCst));
+        assert_eq!(drained.load(Ordering::SeqCst), 2);
+    }
+    Ok(())
+}
