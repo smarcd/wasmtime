@@ -520,6 +520,12 @@ impl StoreOpaque {
         Some(gc_store.expose_gc_ref_to_wasm(exnref).unwrap())
     }
 
+    /// Move the root without allocating or publishing a LIFO handle.
+    #[cfg(feature = "async")]
+    pub(super) fn take_core_pending_exception(&mut self) -> Option<VMGcRef> {
+        self.gc_data.pending_exception.take()
+    }
+
     /// Takes the pending exception of the store, yielding ownership of its
     /// reference to the `Rooted` that's returned.
     fn take_pending_exception_rooted(&mut self) -> Option<Rooted<ExnRef>> {
@@ -788,6 +794,17 @@ impl StoreOpaque {
                 .task_state_mut()
                 .concurrent_state_mut()
                 .trace_fiber_roots(modules, unwind, gc_roots_list);
+        }
+
+        #[cfg(feature = "async")]
+        {
+            let unwind = self.unwinder();
+            let StoreOpaque {
+                core_calls,
+                modules,
+                ..
+            } = self;
+            core_calls.trace_roots(modules, unwind, gc_roots_list);
         }
 
         log::trace!("End trace GC roots :: Wasm stack");

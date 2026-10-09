@@ -9,12 +9,12 @@ use core::pin::Pin;
 use core::ptr::{self, NonNull};
 use core::task::{Context, Poll};
 use wasmtime_fiber::{Fiber, FiberStack, Suspend};
-#[cfg(all(feature = "component-model-async", feature = "gc"))]
+#[cfg(feature = "gc")]
 use wasmtime_unwinder::Unwind;
 
-#[cfg(all(feature = "component-model-async", feature = "gc"))]
+#[cfg(feature = "gc")]
 use super::module::ModuleRegistry;
-#[cfg(all(feature = "component-model-async", feature = "gc"))]
+#[cfg(feature = "gc")]
 use super::vm::GcRootsList;
 
 type WasmtimeResume = Result<NonNull<Context<'static>>>;
@@ -121,6 +121,11 @@ impl Default for AsyncState {
 }
 
 impl AsyncState {
+    /// Identity only, never a capability to resume a stack.
+    pub(crate) fn suspend_identity(&self) -> Option<usize> {
+        self.current_suspend.map(|ptr| ptr.as_ptr() as usize)
+    }
+
     pub(crate) fn last_fiber_stack(&mut self) -> &mut Option<wasmtime_fiber::FiberStack> {
         &mut self.last_fiber_stack
     }
@@ -408,7 +413,6 @@ pub(crate) enum StoreFiberYield {
     /// Indicates the fiber does _not_ need exclusive access across the
     /// suspend/resume interval, meaning the store may be used as needed until
     /// the fiber is resumed.
-    #[cfg(feature = "component-model-async")]
     ReleaseStore,
 }
 
@@ -452,6 +456,13 @@ impl<'a> StoreFiber<'a> {
         self.fiber.take().map(|f| f.into_inner().0.into_stack())
     }
 
+    pub(crate) fn assert_done(&mut self) {
+        assert!(
+            self.fiber().is_none_or(|fiber| fiber.done()),
+            "core cancellation did not finish its fiber"
+        );
+    }
+
     pub(crate) fn dispose(&mut self, store: &mut StoreOpaque) {
         if let Some(fiber) = self.fiber() {
             if !fiber.done() {
@@ -461,7 +472,7 @@ impl<'a> StoreFiber<'a> {
         }
     }
 
-    #[cfg(all(feature = "component-model-async", feature = "gc"))]
+    #[cfg(feature = "gc")]
     pub(crate) fn trace_gc_roots(
         &mut self,
         modules: &ModuleRegistry,
@@ -890,7 +901,6 @@ where
 
 /// Safe wrapper around [`make_fiber_unchecked`] which requires that `S` is
 /// `Send`.
-#[cfg(feature = "component-model-async")]
 pub(crate) fn make_fiber<'a, S>(
     store: &mut S,
     fun: impl FnOnce(&mut S) -> Result<()> + Send + Sync + 'a,
@@ -989,31 +999,40 @@ impl<'b> Future for FiberFuture<'_, 'b> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
 
-        // SAFETY: We need to carry over this `cx` into our fiber's runtime for
-        // when it tries to poll sub-futures that are created. Doing this must
-        // be done unsafely, however, since `cx` is only alive for this one
-        // singular function call. Here we do a `transmute` to extend the
-        // lifetime of `Context` so it can be stored in our `Store`, and then we
-        // replace the current polling context with this one.
-        //
-        // The safety of this extension relies on never actually using
-        // `Context<'static>` with `'static` actually there, which should be
-        // satisfied by the users of this in the `BlockingContext` structure
-        // where the lifetime parameters there are always more constrained than
-        // they are here.
-        let cx: &mut Context<'static> = unsafe { change_context_lifetime(cx) };
-        let cx = NonNull::from(cx);
-
-        match resume_fiber(me.store, me.fiber.as_mut().unwrap(), Ok(cx)) {
-            Ok(Ok(())) => Poll::Ready(Ok(None)),
-            Ok(Err(e)) => Poll::Ready(Err(e)),
-            Err(StoreFiberYield::KeepStore) => Poll::Pending,
-            #[cfg(feature = "component-model-async")]
-            Err(StoreFiberYield::ReleaseStore) => match &me.on_release {
-                OnRelease::ReturnPending => Poll::Pending,
-                OnRelease::ReturnReady => Poll::Ready(Ok(me.fiber.take())),
-            },
+        match poll_store_fiber(me.store, me.fiber.as_mut().unwrap(), cx) {
+            FiberPoll::Finished(result) => Poll::Ready(result.map(|()| None)),
+            FiberPoll::KeepStore => Poll::Pending,
+            FiberPoll::Released => {
+                #[cfg(feature = "component-model-async")]
+                if let OnRelease::ReturnReady = me.on_release {
+                    return Poll::Ready(Ok(me.fiber.take()));
+                }
+                Poll::Pending
+            }
         }
+    }
+}
+
+/// Shared poll boundary for exclusive futures and Store-owned core calls.
+pub(crate) enum FiberPoll {
+    KeepStore,
+    Released,
+    Finished(Result<()>),
+}
+
+pub(crate) fn poll_store_fiber(
+    store: &mut StoreOpaque,
+    fiber: &mut StoreFiber<'_>,
+    cx: &mut Context<'_>,
+) -> FiberPoll {
+    // SAFETY: this Context lives for exactly this poll. BlockingContext only
+    // exposes shorter anonymous lifetimes, removes the pointer on suspension,
+    // and resume_fiber restores all TLS and current-pointer state on return.
+    let cx: &mut Context<'static> = unsafe { change_context_lifetime(cx) };
+    match resume_fiber(store, fiber, Ok(NonNull::from(cx))) {
+        Ok(result) => FiberPoll::Finished(result),
+        Err(StoreFiberYield::KeepStore) => FiberPoll::KeepStore,
+        Err(StoreFiberYield::ReleaseStore) => FiberPoll::Released,
     }
 }
 

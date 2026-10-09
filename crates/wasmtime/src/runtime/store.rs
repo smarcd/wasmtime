@@ -124,6 +124,9 @@ mod async_;
 #[cfg(all(feature = "async", feature = "call-hook"))]
 pub use self::async_::CallHookHandler;
 
+#[cfg(feature = "async")]
+pub(crate) mod core_calls;
+
 #[cfg(feature = "gc")]
 mod gc;
 #[cfg(not(feature = "gc"))]
@@ -488,6 +491,8 @@ pub struct StoreOpaque {
     table_limit: usize,
     #[cfg(feature = "async")]
     async_state: fiber::AsyncState,
+    #[cfg(feature = "async")]
+    core_calls: core_calls::CoreCalls,
 
     // If fuel_yield_interval is enabled, then we store the remaining fuel (that isn't in
     // runtime_limits) here. The total amount of fuel is the runtime limits and reserve added
@@ -746,6 +751,8 @@ impl<T> Store<T> {
             table_limit: crate::DEFAULT_TABLE_LIMIT,
             #[cfg(feature = "async")]
             async_state: Default::default(),
+            #[cfg(feature = "async")]
+            core_calls: Default::default(),
             fuel_reserve: 0,
             fuel_yield_interval: None,
             store_data,
@@ -834,6 +841,8 @@ impl<T> Store<T> {
     }
 
     fn run_manual_drop_routines(&mut self) {
+        #[cfg(feature = "async")]
+        self.inner.drain_core_calls();
         StoreData::run_manual_drop_routines(StoreContextMut(&mut self.inner));
 
         // Ensure all fiber stacks, even cached ones, are all flushed out to the
@@ -1430,6 +1439,8 @@ impl<T> StoreInner<T> {
     }
 
     fn invoke_call_hook(&mut self, call_hook: &mut CallHookInner<T>, s: CallHook) -> Result<()> {
+        #[cfg(feature = "async")]
+        let _core_exclusive = core_calls::CoreGuard::exclusive(&mut self.inner);
         match call_hook {
             #[cfg(feature = "call-hook")]
             CallHookInner::Sync(hook) => hook((&mut *self).as_context_mut(), s),
@@ -2350,6 +2361,8 @@ unsafe impl<T> VMStore for StoreInner<T> {
 
     #[cfg(target_has_atomic = "64")]
     fn new_epoch_updated_deadline(&mut self) -> Result<UpdateDeadline> {
+        #[cfg(feature = "async")]
+        let _core_exclusive = core_calls::CoreGuard::exclusive(&mut self.inner);
         // Temporarily take the configured behavior to avoid mutably borrowing
         // multiple times.
         let mut behavior = self.epoch_deadline_behavior.take();
@@ -2365,6 +2378,7 @@ unsafe impl<T> VMStore for StoreInner<T> {
 
     #[cfg(feature = "debug")]
     fn block_on_debug_handler(&mut self, event: crate::DebugEvent<'_>) -> crate::Result<()> {
+        let _core_exclusive = core_calls::CoreGuard::exclusive(&mut self.inner);
         if let Some(handler) = self.debug_handler.take() {
             if !self.can_block() {
                 bail!("could not invoke debug handler without async context");
@@ -2424,6 +2438,8 @@ impl<T> Drop for Store<T> {
 
 impl Drop for StoreOpaque {
     fn drop(&mut self) {
+        #[cfg(feature = "async")]
+        self.core_calls.assert_drained();
         // NB it's important that this destructor does not access `self.data`.
         // That is deallocated by `Drop for Store<T>` above.
 

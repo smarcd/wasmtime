@@ -445,6 +445,36 @@ impl<T> Linker<T> {
         self.func_insert(module, name, func)
     }
 
+    /// Define a scalar host function that can release an owned core call.
+    ///
+    /// The callback runs synchronously and must return an owned action. Its
+    /// Caller and temporary roots end before suspension. Ordinary async host
+    /// futures remain exclusive; a descendant cannot release through them.
+    /// Return actions also work with ordinary async calls, while Suspend outside
+    /// an owned core root traps with [`crate::CoreCallError::NoActiveCoreCall`].
+    /// Reference-valued signatures are rejected during registration.
+    #[cfg(feature = "async")]
+    pub fn func_new_suspending<F>(
+        &mut self,
+        module: &str,
+        name: &str,
+        ty: FuncType,
+        func: F,
+    ) -> Result<&mut Self>
+    where
+        F: for<'a> Fn(Caller<'a, T>, &'a [crate::CoreValue]) -> Result<crate::CoreHostStep>
+            + Send
+            + Sync
+            + 'static,
+        T: Send + 'static,
+    {
+        self.func_insert(
+            module,
+            name,
+            HostFunc::new_suspending(&self.engine, ty, func)?,
+        )
+    }
+
     /// Creates a [`Func::new_async`]-style function named in this linker.
     ///
     /// For more information see [`Linker::func_wrap`].

@@ -104,6 +104,11 @@ pub use module::{Module, ModuleExport, ModuleFunction};
 pub use resources::*;
 #[cfg(all(feature = "async", feature = "call-hook"))]
 pub use store::CallHookHandler;
+#[cfg(feature = "async")]
+pub use store::core_calls::{
+    CoreCallError, CoreCallEvent, CoreCallFuture, CoreCallId, CoreCallOutcome, CoreHostResult,
+    CoreHostStep, CoreHostWaitId, CoreValue,
+};
 pub use store::{
     AsContext, AsContextMut, CallHook, Store, StoreContext, StoreContextMut, UpdateDeadline,
 };

@@ -2419,6 +2419,114 @@ impl HostFunc {
         // both `enter_host_from_wasm` as well as `unchecked_context_mut`.
         unsafe { vm::Instance::enter_host_from_wasm(caller_vmctx, run) }
     }
+    /// Scalar-only trampoline whose callback/root scope ends before release.
+    #[cfg(feature = "async")]
+    pub(crate) fn new_suspending<T, F>(engine: &Engine, ty: FuncType, func: F) -> Result<Self>
+    where
+        F: for<'a> Fn(Caller<'a, T>, &'a [crate::CoreValue]) -> Result<crate::CoreHostStep>
+            + Send
+            + Sync
+            + 'static,
+        T: Send + 'static,
+    {
+        crate::store::core_calls::scalar_type(&ty)?;
+        assert!(ty.comes_from_same_engine(engine));
+        // SAFETY: the private state and trampoline agree on T, F and the exact
+        // scalar signature. No external raw callback is accepted by this API.
+        let vmctx = unsafe {
+            VMArrayCallHostFuncContext::new(
+                Self::suspending_trampoline::<T, F>,
+                ty.type_index(),
+                try_new::<Box<_>>(HostFuncState {
+                    func: (ty.clone(), func),
+                    _ty: ty.into_registered_type(),
+                })?,
+            )?
+        };
+        Ok(Self::new_raw(engine, vmctx, Asyncness::Yes))
+    }
+
+    #[cfg(feature = "async")]
+    unsafe extern "C" fn suspending_trampoline<T, F>(
+        callee_vmctx: NonNull<VMOpaqueContext>,
+        caller_vmctx: NonNull<VMContext>,
+        args: NonNull<ValRaw>,
+        args_len: usize,
+    ) -> bool
+    where
+        F: for<'a> Fn(Caller<'a, T>, &'a [crate::CoreValue]) -> Result<crate::CoreHostStep>
+            + Send
+            + Sync
+            + 'static,
+        T: Send + 'static,
+    {
+        let run = |store: &mut dyn crate::vm::VMStore, instance: InstanceId| -> Result<()> {
+            // SAFETY: only new_suspending<T,F> installs this trampoline and state.
+            let mut store = unsafe { store.unchecked_context_mut::<T>() };
+            let state = unsafe {
+                let vmctx = VMArrayCallHostFuncContext::from_opaque(callee_vmctx);
+                let state = vmctx.as_ref().host_state();
+                debug_assert!(state.is::<HostFuncState<(FuncType, F)>>());
+                &*(state as *const _ as *const HostFuncState<(FuncType, F)>)
+            };
+            let (ty, callback) = &state.func;
+            assert!(args_len >= ty.params().len().max(ty.results().len()));
+            let mut params = TryVec::new();
+            params.reserve(ty.params().len())?;
+            for (i, ty) in ty.params().enumerate() {
+                // SAFETY: the VM provides the validated signature's initialized
+                // scalar arguments. No reference or borrowed argument slice escapes.
+                params.push(crate::CoreValue::lift(
+                    unsafe { args.as_ptr().add(i).read() },
+                    &ty,
+                ))?;
+            }
+            let instance = Instance::from_wasmtime(instance, store.0);
+            let step = {
+                #[cfg(feature = "gc")]
+                let mut scope = crate::RootScope::new(store.as_context_mut());
+                #[cfg(not(feature = "gc"))]
+                let mut scope = store.as_context_mut();
+                callback(
+                    Caller {
+                        caller: instance,
+                        store: scope.as_context_mut(),
+                    },
+                    &params,
+                )
+            };
+            // Scope and every user Rust frame are gone before this branch can
+            // release. No Store-wide scratch or LIFO roots span the suspension.
+            if store.0.has_pending_exception() {
+                return Err(step.err().unwrap_or_else(|| crate::ThrownException.into()));
+            }
+            let values = match step? {
+                crate::CoreHostStep::Return(values) => values,
+                crate::CoreHostStep::Suspend(token) => {
+                    match store.0.suspend_core_call(
+                        token,
+                        ty.results().try_collect::<TryVec<_>, _>()?.into(),
+                    )? {
+                        crate::CoreHostResult::Return(values) => values,
+                        crate::CoreHostResult::Trap(error) => return Err(error),
+                    }
+                }
+            };
+            crate::store::core_calls::check_values(&values, ty.results())?;
+            for (i, value) in values.into_iter().enumerate() {
+                // SAFETY: results were validated and the VM reserves args_len
+                // slots on this same still-live fiber for the results.
+                unsafe {
+                    args.as_ptr().add(i).write(value.lower());
+                }
+            }
+            Ok(())
+        };
+        // SAFETY: this is a correctly typed VM entry, with the same trap and
+        // panic boundary used by the ordinary host trampoline.
+        unsafe { vm::Instance::enter_host_from_wasm(caller_vmctx, run) }
+    }
+
     /// Analog of [`Func::new_unchecked`]
     ///
     /// # Panics
