@@ -2197,3 +2197,241 @@ async fn core_continuations_teardown_drains_before_user_data() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(any(feature = "gc-copying", feature = "gc-drc"))]
+mod callback_entry {
+    use super::*;
+
+    fn collectors() -> Vec<Collector> {
+        vec![
+            #[cfg(feature = "gc-copying")]
+            Collector::Copying,
+            #[cfg(feature = "gc-drc")]
+            Collector::DeferredReferenceCounting,
+        ]
+    }
+
+    // A prior ordinary import's discarded marker cannot authorize the next
+    // callback, its side effects, a wait, or selection of a guest EH handler.
+    async fn rejects_preexisting(suspend: bool, owned: bool) -> Result<()> {
+        for collector in collectors() {
+            let mut config = Config::new();
+            config.collector(collector).wasm_exceptions(true);
+            let engine = Engine::new(&config)?;
+            let mut store = Store::new(&engine, ());
+            let tag = Tag::new(
+                &mut store,
+                &TagType::new(FuncType::new(
+                    &engine,
+                    [ValType::I32, ValType::EXTERNREF],
+                    [],
+                )),
+            )?;
+            let ty = ExnType::from_tag_type(&tag.ty(&store))?;
+            let pre = ExnRefPre::new(&mut store, ty);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let count = drops.clone();
+            let mut linker = Linker::new(&engine);
+            linker.func_wrap(
+                "test",
+                "orphan",
+                move |mut caller: Caller<'_, ()>| -> Result<()> {
+                    let mut scope = RootScope::new(&mut caller);
+                    let payload = ExternRef::new(&mut scope, Probe(count.clone()))?;
+                    let exn = ExnRef::new(
+                        &mut scope,
+                        &pre,
+                        &tag,
+                        &[Val::I32(77), Val::ExternRef(Some(payload))],
+                    )?;
+                    let marker = scope.as_context_mut().throw::<()>(exn).unwrap_err();
+                    assert!(marker.is::<ThrownException>());
+                    drop(marker);
+                    Ok(())
+                },
+            )?;
+            let invoked = Arc::new(AtomicUsize::new(0));
+            let calls = invoked.clone();
+            linker.func_new_suspending(
+                "test",
+                "next",
+                FuncType::new(&engine, [], []),
+                move |_, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(if suspend {
+                        CoreHostStep::Suspend(9)
+                    } else {
+                        CoreHostStep::Return(vec![])
+                    })
+                },
+            )?;
+            let module = Module::new(
+                &engine,
+                r#"(module
+                (import "test" "orphan" (func $orphan))
+                (import "test" "next" (func $next))
+                (global $handled (export "handled") (mut i32) (i32.const 0))
+                (func (export "run")
+                    (block $caught
+                        (try_table (catch_all $caught) call $orphan call $next return))
+                    i32.const 1 global.set $handled)
+                (func (export "ok") (result i32) i32.const 123))"#,
+            )?;
+            let instance = linker.instantiate_async(&mut store, &module).await?;
+            let func = instance.get_func(&mut store, "run").unwrap();
+            let result = if owned {
+                let id = store.start_core_call(func, vec![])?;
+                assert_eq!(
+                    store.resume_core_call(id)?.await?,
+                    CoreCallEvent::Finished { call: id }
+                );
+                finish_ok(&mut store, id).map(|_| ())
+            } else {
+                func.typed::<(), ()>(&store)?
+                    .call_async(&mut store, ())
+                    .await
+            };
+            assert_eq!(
+                invoked.load(Ordering::SeqCst),
+                0,
+                "entered callback with an earlier import's pending payload"
+            );
+            assert_eq!(
+                instance
+                    .get_global(&mut store, "handled")
+                    .unwrap()
+                    .get(&mut store)
+                    .i32(),
+                Some(0),
+                "selected an EH handler for an unmarked orphan"
+            );
+            error(result, CoreCallError::PendingException);
+            if owned {
+                assert!(
+                    store.take_pending_exception().is_none(),
+                    "owned terminal left the orphan active"
+                );
+            } else {
+                store.gc(None)?;
+                assert_eq!(
+                    drops.load(Ordering::SeqCst),
+                    0,
+                    "ordinary call consumed the caller's pending payload"
+                );
+                let mut scope = RootScope::new(&mut store);
+                let pending = scope
+                    .as_context_mut()
+                    .take_pending_exception()
+                    .expect("ordinary call lost the pending slot");
+                assert!(Tag::eq(&pending.tag(&mut scope)?, &tag, &scope));
+                assert_eq!(pending.field(&mut scope, 0)?.i32(), Some(77));
+                let field = pending.field(&mut scope, 1)?;
+                let payload = field.externref().unwrap().unwrap();
+                let probe = payload
+                    .data(&scope)?
+                    .unwrap()
+                    .downcast_ref::<Probe>()
+                    .unwrap();
+                assert!(Arc::ptr_eq(&probe.0, &drops));
+            }
+            store.gc(None)?;
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                1,
+                "rejected entry leaked the orphan payload"
+            );
+            assert!(store.take_pending_exception().is_none());
+            let ok = instance.get_func(&mut store, "ok").unwrap();
+            let later = store.start_core_call(ok, vec![])?;
+            assert_eq!(
+                store.resume_core_call(later)?.await?,
+                CoreCallEvent::Finished { call: later }
+            );
+            assert_eq!(finish_ok(&mut store, later)?, [CoreValue::I32(123)]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preexisting_return_ordinary() -> Result<()> {
+        rejects_preexisting(false, false).await
+    }
+    #[tokio::test]
+    async fn preexisting_suspend_ordinary() -> Result<()> {
+        rejects_preexisting(true, false).await
+    }
+    #[tokio::test]
+    async fn preexisting_return_owned() -> Result<()> {
+        rejects_preexisting(false, true).await
+    }
+    #[tokio::test]
+    async fn preexisting_suspend_owned() -> Result<()> {
+        rejects_preexisting(true, true).await
+    }
+
+    // Empty-slot admission permits a payload produced by this callback to
+    // propagate for either successful action. Neither action may publish a wait.
+    async fn fresh_pending(suspend: bool) -> Result<()> {
+        for collector in collectors() {
+            let mut config = Config::new();
+            config.collector(collector).wasm_exceptions(true);
+            let engine = Engine::new(&config)?;
+            let mut store = Store::new(&engine, ());
+            let tag = Tag::new(
+                &mut store,
+                &TagType::new(FuncType::new(&engine, [ValType::I32], [])),
+            )?;
+            let ty = ExnType::from_tag_type(&tag.ty(&store))?;
+            let pre = ExnRefPre::new(&mut store, ty);
+            let invoked = Arc::new(AtomicUsize::new(0));
+            let calls = invoked.clone();
+            let mut linker = Linker::new(&engine);
+            linker.func_new_suspending(
+                "test",
+                "fresh",
+                FuncType::new(&engine, [], []),
+                move |mut caller, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let exn = ExnRef::new(&mut caller, &pre, &tag, &[Val::I32(42)])?;
+                    let marker = caller.as_context_mut().throw::<()>(exn).unwrap_err();
+                    assert!(marker.is::<ThrownException>());
+                    drop(marker);
+                    Ok(if suspend {
+                        CoreHostStep::Suspend(9)
+                    } else {
+                        CoreHostStep::Return(vec![])
+                    })
+                },
+            )?;
+            let module = Module::new(
+                &engine,
+                r#"(module
+                (import "test" "fresh" (func $fresh)) (func (export "run") call $fresh))"#,
+            )?;
+            let instance = linker.instantiate_async(&mut store, &module).await?;
+            let func = instance.get_func(&mut store, "run").unwrap();
+            let id = store.start_core_call(func, vec![])?;
+            assert_eq!(
+                store.resume_core_call(id)?.await?,
+                CoreCallEvent::Finished { call: id }
+            );
+            assert_eq!(invoked.load(Ordering::SeqCst), 1);
+            assert!(store.take_pending_exception().is_none());
+            let CoreCallOutcome::Exception { exception, .. } = store.take_core_call_outcome(id)?
+            else {
+                panic!("fresh callback payload did not propagate as Exception");
+            };
+            assert!(Tag::eq(&exception.tag(&mut store)?, &tag, &store));
+            assert_eq!(exception.field(&mut store, 0)?.i32(), Some(42));
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn fresh_return_exception() -> Result<()> {
+        fresh_pending(false).await
+    }
+    #[tokio::test]
+    async fn fresh_suspend_exception() -> Result<()> {
+        fresh_pending(true).await
+    }
+}
