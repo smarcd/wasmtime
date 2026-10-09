@@ -1922,3 +1922,95 @@ async fn core_continuations_cancellation_drop_panic() -> Result<()> {
     finish_ok(&mut store, sibling)?;
     Ok(())
 }
+
+#[cfg(any(feature = "gc-copying", feature = "gc-drc"))]
+mod outcome_classification {
+    use super::*;
+
+    async fn orphaned_payload(return_error: bool) -> Result<()> {
+        let collectors = [
+            #[cfg(feature = "gc-copying")]
+            Collector::Copying,
+            #[cfg(feature = "gc-drc")]
+            Collector::DeferredReferenceCounting,
+        ];
+        for collector in collectors {
+            let mut config = Config::new();
+            config.collector(collector).wasm_exceptions(true);
+            let engine = Engine::new(&config)?;
+            let mut store = Store::new(&engine, ());
+            let tag = Tag::new(
+                &mut store,
+                &TagType::new(FuncType::new(&engine, [ValType::EXTERNREF], [])),
+            )?;
+            let ty = ExnType::from_tag_type(&tag.ty(&store))?;
+            let pre = ExnRefPre::new(&mut store, ty);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let count = drops.clone();
+            let mut linker = Linker::new(&engine);
+            linker.func_wrap(
+                "test",
+                "orphan",
+                move |mut caller: Caller<'_, ()>| -> Result<()> {
+                    let mut scope = RootScope::new(&mut caller);
+                    let payload = ExternRef::new(&mut scope, Probe(count.clone()))?;
+                    let exn =
+                        ExnRef::new(&mut scope, &pre, &tag, &[Val::ExternRef(Some(payload))])?;
+                    let marker = scope.as_context_mut().throw::<()>(exn).unwrap_err();
+                    assert!(marker.is::<ThrownException>());
+                    drop(marker);
+                    if return_error {
+                        bail!("ordinary host failure")
+                    }
+                    Ok(())
+                },
+            )?;
+            let module = Module::new(
+                &engine,
+                r#"(module
+              (import "test" "orphan" (func $orphan))
+              (func (export "run") call $orphan))"#,
+            )?;
+            let instance = linker.instantiate_async(&mut store, &module).await?;
+            let func = instance.get_func(&mut store, "run").unwrap();
+            let id = store.start_core_call(func, vec![])?;
+            assert_eq!(
+                store.resume_core_call(id)?.await?,
+                CoreCallEvent::Finished { call: id }
+            );
+            assert!(
+                store.take_pending_exception().is_none(),
+                "terminal call left orphan in pending slot"
+            );
+            match store.take_core_call_outcome(id)? {
+                CoreCallOutcome::Trapped(error) if return_error => {
+                    assert!(
+                        error.to_string().contains("ordinary host failure"),
+                        "lost original host diagnostic: {error:?}"
+                    );
+                    assert!(!error.is::<ThrownException>());
+                }
+                CoreCallOutcome::Returned(values) if !return_error => assert!(values.is_empty()),
+                _ => panic!("orphaned pending payload overrode the actual call result"),
+            }
+            store.gc(None)?;
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                1,
+                "orphaned pending payload root leaked"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn core_continuations_orphan_does_not_override_trap() -> Result<()> {
+        orphaned_payload(true).await
+    }
+
+    #[tokio::test]
+    async fn core_continuations_orphan_does_not_override_return() -> Result<()> {
+        orphaned_payload(false).await
+    }
+}
+
