@@ -1356,6 +1356,8 @@ fn run_child_test(name: &str, key: &str, mode: &str, timeout_secs: u64) -> Resul
     let mut child = std::process::Command::new(std::env::current_exe()?)
         .args([name, "--exact", "--nocapture"])
         .env(key, mode)
+        // Exercise libtest's same-line test-name prefix even on multicore hosts.
+        .env("RUST_TEST_THREADS", "1")
         .stdout(std::process::Stdio::piped())
         .spawn()?;
     let mut stdout = child.stdout.take().unwrap();
