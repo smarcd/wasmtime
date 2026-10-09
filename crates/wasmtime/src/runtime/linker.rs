@@ -453,6 +453,16 @@ impl<T> Linker<T> {
     /// Return actions also work with ordinary async calls, while Suspend outside
     /// an owned core root traps with [`crate::CoreCallError::NoActiveCoreCall`].
     /// Reference-valued signatures are rejected during registration.
+    ///
+    /// A pending exception rejects callback entry with
+    /// [`crate::CoreCallError::PendingException`] without consuming the slot.
+    /// If the admitted callback leaves a pending exception, either successful
+    /// action propagates that exception instead. A callback error is preserved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the given scalar function type is not associated with the same
+    /// engine as this linker.
     #[cfg(feature = "async")]
     pub fn func_new_suspending<F>(
         &mut self,

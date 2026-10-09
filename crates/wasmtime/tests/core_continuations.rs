@@ -1349,31 +1349,67 @@ mod gc_controls {
     }
 }
 
+// Exit success alone also describes a misspelled --exact filter. Require the
+// selected body to finish and the harness to report its one successful test.
+fn run_child_test(name: &str, key: &str, mode: &str, timeout_secs: u64) -> Result<()> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .args([name, "--exact", "--nocapture"])
+        .env(key, mode)
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().unwrap();
+    // Drain while the child runs so captured panic output cannot fill the pipe.
+    let reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).map(|_| output)
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            let _ = reader.join();
+            bail!("{name} child exceeded {timeout_secs} seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let output = reader.join().expect("child stdout reader panicked")?;
+    print!("{output}");
+    ensure!(status.success(), "{name} child failed: {status}");
+    let marker = format!("core-continuations-child-completed:{name}:{mode}");
+    ensure!(
+        output.lines().any(|line| line == marker)
+            && output.contains("test result: ok. 1 passed; 0 failed;"),
+        "{name} child did not complete exactly one selected test"
+    );
+    Ok(())
+}
+
+#[test]
+fn core_continuations_child_filter_must_match() {
+    let err = run_child_test(
+        "core_continuations_deliberately_missing_child",
+        "WASMTIME_CORE_MISSING_CHILD",
+        "1",
+        30,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("child did not complete exactly one selected test")
+    );
+}
+
 #[test]
 fn core_continuations_forgotten_pending() -> Result<()> {
     const CHILD: &str = "WASMTIME_CORE_FORGET_CHILD";
     if std::env::var_os(CHILD).is_none() {
         for mode in ["drop", "into_data"] {
-            let mut child = std::process::Command::new(std::env::current_exe()?)
-                .args([
-                    "--exact",
-                    "core_continuations_forgotten_pending",
-                    "--nocapture",
-                ])
-                .env(CHILD, mode)
-                .spawn()?;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    assert!(status.success());
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    child.kill()?;
-                    panic!("forgotten future child hung");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            run_child_test("core_continuations_forgotten_pending", CHILD, mode, 20)?;
         }
         return Ok(());
     }
@@ -1461,8 +1497,13 @@ fn core_continuations_forgotten_pending() -> Result<()> {
             0,
             "forgotten exclusive stack was recovered"
         );
-        Ok(())
-    })
+        Ok::<(), Error>(())
+    })?;
+    println!(
+        "core-continuations-child-completed:core_continuations_forgotten_pending:{}",
+        std::env::var(CHILD)?
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -2122,27 +2163,12 @@ async fn core_continuations_teardown_drains_before_user_data() -> Result<()> {
     use std::sync::atomic::AtomicBool;
     const CHILD: &str = "WASMTIME_CORE_TEARDOWN_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let mut child = std::process::Command::new(std::env::current_exe()?)
-            .args([
-                "core_continuations_teardown_drains_before_user_data",
-                "--exact",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .spawn()?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            if let Some(status) = child.try_wait()? {
-                assert!(status.success(), "teardown ordering child failed: {status}");
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                child.kill()?;
-                child.wait()?;
-                panic!("teardown ordering child exceeded 30 seconds");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        return run_child_test(
+            "core_continuations_teardown_drains_before_user_data",
+            CHILD,
+            "1",
+            30,
+        );
     }
     struct Data(Arc<AtomicBool>);
     impl Drop for Data {
@@ -2195,6 +2221,9 @@ async fn core_continuations_teardown_drains_before_user_data() -> Result<()> {
         assert!(!alive.load(Ordering::SeqCst));
         assert_eq!(drained.load(Ordering::SeqCst), 2);
     }
+    println!(
+        "core-continuations-child-completed:core_continuations_teardown_drains_before_user_data:1"
+    );
     Ok(())
 }
 
@@ -2285,7 +2314,10 @@ mod callback_entry {
                     store.resume_core_call(id)?.await?,
                     CoreCallEvent::Finished { call: id }
                 );
-                finish_ok(&mut store, id).map(|_| ())
+                match store.take_core_call_outcome(id)? {
+                    CoreCallOutcome::Trapped(error) => Err(error),
+                    _ => bail!("rejected callback entry did not produce a Trapped outcome"),
+                }
             } else {
                 func.typed::<(), ()>(&store)?
                     .call_async(&mut store, ())
@@ -2434,4 +2466,90 @@ mod callback_entry {
     async fn fresh_suspend_exception() -> Result<()> {
         fresh_pending(true).await
     }
+}
+
+#[cfg(feature = "call-hook")]
+#[tokio::test]
+async fn core_continuations_suspending_hook_order() -> Result<()> {
+    let engine = Engine::default();
+    for suspend in [false, true] {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut store = Store::new(&engine, ());
+        let mut linker = Linker::new(&engine);
+        let callback_events = events.clone();
+        linker.func_new_suspending(
+            "test",
+            "host",
+            FuncType::new(&engine, [], []),
+            move |_, _| {
+                callback_events.lock().unwrap().push("Callback");
+                Ok(if suspend {
+                    CoreHostStep::Suspend(7)
+                } else {
+                    CoreHostStep::Return(vec![])
+                })
+            },
+        )?;
+        let module = Module::new(
+            &engine,
+            r#"(module
+            (import "test" "host" (func $host)) (func (export "run") call $host))"#,
+        )?;
+        let instance = linker.instantiate_async(&mut store, &module).await?;
+        let hook_events = events.clone();
+        store.call_hook(move |_, event| {
+            hook_events.lock().unwrap().push(match event {
+                CallHook::CallingWasm => "CallingWasm",
+                CallHook::CallingHost => "CallingHost",
+                CallHook::ReturningFromHost => "ReturningFromHost",
+                CallHook::ReturningFromWasm => "ReturningFromWasm",
+            });
+            Ok(())
+        });
+        let func = instance.get_func(&mut store, "run").unwrap();
+        let id = store.start_core_call(func, vec![])?;
+        let event = store.resume_core_call(id)?.await?;
+        if suspend {
+            let w = wait(event, id);
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["CallingWasm", "CallingHost", "Callback"]
+            );
+            events.lock().unwrap().push("Suspended");
+            store.complete_core_host_wait(w, CoreHostResult::Return(vec![]))?;
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["CallingWasm", "CallingHost", "Callback", "Suspended"]
+            );
+            assert_eq!(
+                store.resume_core_call(id)?.await?,
+                CoreCallEvent::Finished { call: id }
+            );
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    "CallingWasm",
+                    "CallingHost",
+                    "Callback",
+                    "Suspended",
+                    "ReturningFromHost",
+                    "ReturningFromWasm"
+                ]
+            );
+        } else {
+            assert_eq!(event, CoreCallEvent::Finished { call: id });
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    "CallingWasm",
+                    "CallingHost",
+                    "Callback",
+                    "ReturningFromHost",
+                    "ReturningFromWasm"
+                ]
+            );
+        }
+        finish_ok(&mut store, id)?;
+    }
+    Ok(())
 }

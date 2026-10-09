@@ -2463,6 +2463,12 @@ impl HostFunc {
         let run = |store: &mut dyn crate::vm::VMStore, instance: InstanceId| -> Result<()> {
             // SAFETY: only new_suspending<T,F> installs this trampoline and state.
             let mut store = unsafe { store.unchecked_context_mut::<T>() };
+            // A prior import or CallingHost hook cannot lend its abandoned
+            // exception to this callback. Preserve the slot for its caller;
+            // an owned core root settles its own orphan on terminal exit.
+            if store.0.has_pending_exception() {
+                return Err(crate::CoreCallError::PendingException.into());
+            }
             let state = unsafe {
                 let vmctx = VMArrayCallHostFuncContext::from_opaque(callee_vmctx);
                 let state = vmctx.as_ref().host_state();
