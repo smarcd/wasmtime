@@ -1384,7 +1384,7 @@ fn run_child_test(name: &str, key: &str, mode: &str, timeout_secs: u64) -> Resul
     ensure!(status.success(), "{name} child failed: {status}");
     let marker = format!("core-continuations-child-completed:{name}:{mode}");
     ensure!(
-        output.lines().any(|line| line == marker)
+        output.lines().any(|line| line.ends_with(&marker))
             && output.contains("test result: ok. 1 passed; 0 failed;"),
         "{name} child did not complete exactly one selected test"
     );
@@ -2460,6 +2460,96 @@ mod callback_entry {
         }
         Ok(())
     }
+    #[tokio::test]
+    async fn fresh_error_preserves_diagnostic() -> Result<()> {
+        for collector in collectors() {
+            let mut config = Config::new();
+            config.collector(collector).wasm_exceptions(true);
+            let engine = Engine::new(&config)?;
+            let mut store = Store::new(&engine, ());
+            let tag = Tag::new(
+                &mut store,
+                &TagType::new(FuncType::new(&engine, [ValType::EXTERNREF], [])),
+            )?;
+            let ty = ExnType::from_tag_type(&tag.ty(&store))?;
+            let pre = ExnRefPre::new(&mut store, ty);
+            let invoked = Arc::new(AtomicUsize::new(0));
+            let calls = invoked.clone();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let count = drops.clone();
+            let mut linker = Linker::new(&engine);
+            linker.func_new_suspending(
+                "test",
+                "fresh",
+                FuncType::new(&engine, [], []),
+                move |mut caller, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let payload = ExternRef::new(&mut caller, Probe(count.clone()))?;
+                    let exn =
+                        ExnRef::new(&mut caller, &pre, &tag, &[Val::ExternRef(Some(payload))])?;
+                    let marker = caller.as_context_mut().throw::<()>(exn).unwrap_err();
+                    assert!(marker.is::<ThrownException>());
+                    drop(marker);
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "fresh callback failure",
+                    )
+                    .into())
+                },
+            )?;
+            let module = Module::new(
+                &engine,
+                r#"(module
+                (import "test" "fresh" (func $fresh))
+                (global $handled (export "handled") (mut i32) (i32.const 0))
+                (func (export "run")
+                    (block $caught (try_table (catch_all $caught) call $fresh return))
+                    i32.const 1 global.set $handled)
+                (func (export "ok") (result i32) i32.const 123))"#,
+            )?;
+            let instance = linker.instantiate_async(&mut store, &module).await?;
+            let func = instance.get_func(&mut store, "run").unwrap();
+            let id = store.start_core_call(func, vec![])?;
+            assert_eq!(
+                store.resume_core_call(id)?.await?,
+                CoreCallEvent::Finished { call: id }
+            );
+            assert_eq!(invoked.load(Ordering::SeqCst), 1);
+            let CoreCallOutcome::Trapped(error) = store.take_core_call_outcome(id)? else {
+                panic!("fresh callback error was replaced by exception authority");
+            };
+            let original = error
+                .downcast_ref::<std::io::Error>()
+                .expect("lost original callback error type");
+            assert_eq!(original.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(original.to_string(), "fresh callback failure");
+            assert!(!error.is::<ThrownException>());
+            assert_eq!(
+                instance
+                    .get_global(&mut store, "handled")
+                    .unwrap()
+                    .get(&mut store)
+                    .i32(),
+                Some(0)
+            );
+            assert!(store.take_pending_exception().is_none());
+            store.gc(None)?;
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                1,
+                "fresh error leaked its orphan payload"
+            );
+            let ok = instance.get_func(&mut store, "ok").unwrap();
+            let later = store.start_core_call(ok, vec![])?;
+            assert_eq!(
+                store.resume_core_call(later)?.await?,
+                CoreCallEvent::Finished { call: later }
+            );
+            assert_eq!(finish_ok(&mut store, later)?, [CoreValue::I32(123)]);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn fresh_return_exception() -> Result<()> {
         fresh_pending(false).await
